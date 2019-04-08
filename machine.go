@@ -1,257 +1,174 @@
 package machine
 
 import (
-	"fmt"
-	"time"
-	"sync"
 	"errors"
+	"fmt"
 	"net/http"
+	"sync"
+	"time"
 
-	"github.com/gorilla/websocket"
 	"github.com/aglyzov/log15"
+	"github.com/gorilla/websocket"
+	"os"
 )
 
 var Log = log15.New("pkg", "machine")
 
-type State   byte
-type Command byte
-
 type (
+	State   byte
+	Command byte
 	Machine struct {
-		URL		string
-		Headers	http.Header
-		Input	<-chan []byte
-		Output	chan<- []byte
-		Status	<-chan Status
-		Command	chan<- Command
+		URL               string
+		Headers           http.Header
+		Input             <-chan []byte
+		Output            chan<- []byte
+		Status            <-chan Status
+		Command           chan<- Command
+		ReconnectInterval string
+		KeepAliveInterval string
 	}
 	Status struct {
-		State	State
-		Error	error
+		State State
+		Error error
 	}
 )
 
 const (
 	// states
-	DISCONNECTED State = iota
-	CONNECTING
-	CONNECTED
-	WAITING
+	Disconnected State = iota
+	Connecting
+	Connected
+	Waiting
 )
 const (
 	// commands
-	QUIT       Command = 16 + iota
-	PING
-	USE_TEXT
-	USE_BINARY
+	Quit Command = 16 + iota
+	Ping
+	UseText
+	UseBinary
 )
+
+const (
+	reconnectInterval = "34s"
+	keepaliveInterval = "34s"
+)
+
+var wg sync.WaitGroup
+var inputChannel chan []byte
+var outputChannel chan []byte
+var statusChannel chan Status
+var commandChannel chan Command
+
+var connReturnChannel chan *websocket.Conn
+var connCancelChannel chan bool
+
+var readErrorChannel chan error
+var writeErrorChannel chan error
+var writeControlChannel chan Command
+
+var ioEventChannel chan bool
 
 func init() {
 	// disable the logger by default
-	Log.SetHandler(log15.DiscardHandler())
+	//Log.SetHandler(log15.DiscardHandler())
 }
 
 func (s State) String() string {
 	switch s {
-	case DISCONNECTED:  return "DISCONNECTED"
-	case CONNECTING:    return "CONNECTING"
-	case CONNECTED:     return "CONNECTED"
-	case WAITING:       return "WAITING"
+	case Disconnected:
+		return "Disconnected"
+	case Connecting:
+		return "Connecting"
+	case Connected:
+		return "Connected"
+	case Waiting:
+		return "Waiting"
 	}
-	return fmt.Sprintf("UNKNOWN STATUS %v", s)
+	return fmt.Sprintf("Unknown status %v", s)
 }
 
 func (c Command) String() string {
 	switch c {
-	case QUIT:        return "QUIT"
-	case PING:        return "PING"
-	case USE_TEXT:    return "USE_TEXT"
-	case USE_BINARY:  return "USE_BINARY"
+	case Quit:
+		return "Quit"
+	case Ping:
+		return "Ping"
+	case UseText:
+		return "UseText"
+	case UseBinary:
+		return "UseBinary"
 	}
-	return fmt.Sprintf("UNKNOWN COMMAND %v", c)
+	return fmt.Sprintf("Unknown command %v", c)
 }
 
 func New(url string, headers http.Header) *Machine {
-	inp_ch := make(chan []byte,  8)
-	out_ch := make(chan []byte,  8)
-	sts_ch := make(chan Status,  2)
-	cmd_ch := make(chan Command, 2)
+	inputChannel = make(chan []byte, 8)
+	outputChannel = make(chan []byte, 8)
+	statusChannel = make(chan Status, 2)
+	commandChannel = make(chan Command, 2)
 
-	con_return_ch := make(chan *websocket.Conn, 1)
-	con_cancel_ch := make(chan bool,     1)
+	connReturnChannel = make(chan *websocket.Conn, 1)
+	connCancelChannel = make(chan bool, 1)
 
-	r_error_ch    := make(chan error,    1)
-	w_error_ch    := make(chan error,    1)
-	w_control_ch  := make(chan Command,  1)
+	readErrorChannel = make(chan error, 1)
+	writeErrorChannel = make(chan error, 1)
+	writeControlChannel = make(chan Command, 1)
 
-	io_event_ch   := make(chan bool,     2)
+	ioEventChannel = make(chan bool, 2)
 
-	var wg sync.WaitGroup
+	return &Machine{url, headers, inputChannel, outputChannel, statusChannel, commandChannel, reconnectInterval, keepaliveInterval}
+}
 
-	connect := func() {
-		wg.Add(1)
-		defer wg.Done()
-
-		Log.Debug("connect has started")
-
-		for {
-			sts_ch <- Status{State:CONNECTING}
-			dialer := websocket.Dialer{HandshakeTimeout: 5*time.Second}
-			conn, _, err := dialer.Dial(url, headers)
-			if err == nil {
-				conn.SetPongHandler(func(string) error {io_event_ch <- true; return nil})
-				con_return_ch <- conn
-				sts_ch <- Status{State:CONNECTED}
-				return
-			} else {
-				Log.Debug("connect error", "err", err)
-				sts_ch <- Status{DISCONNECTED, err}
-			}
-
-			sts_ch <- Status{State:WAITING}
-			select {
-			case <- time.After(34*time.Second):
-			case <- con_cancel_ch:
-				sts_ch <- Status{DISCONNECTED, errors.New("cancelled")}
-				return
-			}
-		}
-	}
-	keep_alive := func() {
-		wg.Add(1)
-		defer wg.Done()
-
-		Log.Debug("keep_alive has started")
-
-		dur   := 34 * time.Second
-		timer := time.NewTimer(dur)
-		timer.Stop()
-
-		loop:
-		for {
-			select {
-			case _, ok := <-io_event_ch:
-				if ok {
-					timer.Reset(dur)
-				} else {
-					timer.Stop()
-					break loop
-				}
-			case <-timer.C:
-				timer.Reset(dur)
-				// non-blocking PING request
-				select {
-				case w_control_ch <- PING:
-				default:
-				}
-			}
-		}
-	}
-	read := func(conn *websocket.Conn) {
-		wg.Add(1)
-		defer wg.Done()
-
-		Log.Debug("read has started")
-
-		for {
-			if _, msg, err := conn.ReadMessage(); err == nil {
-				Log.Debug("received message", "msg", string(msg))
-				io_event_ch <- true
-				inp_ch <- msg
-			} else {
-				Log.Debug("read error", "err", err)
-				r_error_ch <- err
-				break
-			}
-		}
-	}
-	write := func(conn *websocket.Conn, msg_type int) {
-		wg.Add(1)
-		defer wg.Done()
-
-		Log.Debug("write has started")
-
-		loop:
-		for {
-			select {
-			case msg, ok := <-out_ch:
-				if ok {
-					io_event_ch <- true
-					if err := conn.SetWriteDeadline(time.Now().Add(3*time.Second)); err != nil {
-						w_error_ch <- err
-						break loop
-					}
-					if err := conn.WriteMessage(msg_type, msg); err != nil {
-						w_error_ch <- err
-						break loop
-					}
-					conn.SetWriteDeadline(time.Time{})  // reset write deadline
-				} else {
-					Log.Debug("write error", "err", "out_ch closed")
-					w_error_ch <- errors.New("out_ch closed")
-					break loop
-				}
-			case cmd, ok := <-w_control_ch:
-				if !ok {
-					w_error_ch <- errors.New("w_control_ch closed")
-					break loop
-				} else {
-					switch cmd {
-					case QUIT:
-						Log.Debug("write received QUIT command")
-						w_error_ch <- errors.New("cancelled")
-						break loop
-					case PING:
-						if err := conn.WriteControl(websocket.PingMessage, []byte{}, time.Now().Add(3*time.Second)); err != nil {
-							Log.Debug("ping error", "err", err)
-							w_error_ch <- errors.New("cancelled")
-							break loop
-						}
-					case USE_TEXT:
-						msg_type = websocket.TextMessage
-					case USE_BINARY:
-						msg_type = websocket.BinaryMessage
-					}
-				}
-			}
-		}
-	}
-
+func (m *Machine) Start() {
 	go func() {
 		// local state
 		var conn *websocket.Conn
-		reading	 := false
-		writing  := false
-		msg_type := websocket.BinaryMessage  // use Binary messages by default
+		reading := false
+		writing := false
+		messageType := websocket.BinaryMessage // use Binary messages by default
 
 		defer func() {
 			Log.Debug("cleanup has started")
-			if conn != nil {conn.Close()}  // this also makes reader to exit
+			if conn != nil {
+				conn.Close()
+			} // this also makes reader to exit
 
 			// close local output channels
-			close(con_cancel_ch)  // this makes connect    to exit
-			close(w_control_ch)   // this makes write      to exit
-			close(io_event_ch)    // this makes keep_alive to exit
+			close(connCancelChannel)   // this makes connect to exit
+			close(writeControlChannel) // this makes write to exit
+			close(ioEventChannel)      // this makes keepAlive to exit
 
 			// drain input channels
-			<-time.After(50*time.Millisecond)  // small pause to let things react
+			<-time.After(50 * time.Millisecond) // small pause to let things react
 
-			drain_loop:
+		drainLoop:
 			for {
 				select {
-				case _, ok := <-out_ch:
-					if !ok {out_ch = nil}
-				case _, ok := <-cmd_ch:
-					if !ok {inp_ch = nil}
-				case conn, ok := <-con_return_ch:
-					if conn != nil {conn.Close()}
-					if !ok {con_return_ch = nil}
-				case _, ok := <-r_error_ch:
-					if !ok {r_error_ch = nil}
-				case _, ok := <-w_error_ch:
-					if !ok {w_error_ch = nil}
+				case _, ok := <-outputChannel:
+					if !ok {
+						outputChannel = nil
+					}
+				case _, ok := <-commandChannel:
+					if !ok {
+						inputChannel = nil
+					}
+				case conn, ok := <-connReturnChannel:
+					if conn != nil {
+						conn.Close()
+					}
+					if !ok {
+						connReturnChannel = nil
+					}
+				case _, ok := <-readErrorChannel:
+					if !ok {
+						readErrorChannel = nil
+					}
+				case _, ok := <-writeErrorChannel:
+					if !ok {
+						writeErrorChannel = nil
+					}
 				default:
-					break drain_loop
+					break drainLoop
 				}
 			}
 
@@ -259,35 +176,35 @@ func New(url string, headers http.Header) *Machine {
 			wg.Wait()
 
 			// close output channels
-			close(inp_ch)
-			close(sts_ch)
+			close(inputChannel)
+			close(statusChannel)
 		}()
 
 		Log.Debug("main loop has started")
 
-		go connect()
-		go keep_alive()
+		go m.connect()
+		go m.keepAlive()
 
-		main_loop:
+	mainLoop:
 		for {
 			select {
-			case conn = <-con_return_ch:
+			case conn = <-connReturnChannel:
 				if conn == nil {
-					break main_loop
+					break mainLoop
 				}
 				Log.Debug("connected", "local", conn.LocalAddr(), "remote", conn.RemoteAddr())
 				reading = true
 				writing = true
 				go read(conn)
-				go write(conn, msg_type)
+				go write(conn, messageType)
 
-			case err := <-r_error_ch:
+			case err := <-readErrorChannel:
 				reading = false
 				if writing {
 					// write goroutine is still active
 					Log.Debug("read error -> stopping write")
-					w_control_ch <- QUIT  // ask write to exit
-					sts_ch <- Status{DISCONNECTED, err}
+					writeControlChannel <- Quit // ask write to exit
+					statusChannel <- Status{Disconnected, err}
 				} else {
 					// both read and write goroutines have exited
 					Log.Debug("read error -> starting connect()")
@@ -295,46 +212,194 @@ func New(url string, headers http.Header) *Machine {
 						conn.Close()
 						conn = nil
 					}
-					go connect()
+					go m.connect()
 				}
-			case err := <-w_error_ch:
+			case err := <-writeErrorChannel:
 				// write goroutine has exited
 				writing = false
 				if reading {
 					// read goroutine is still active
 					Log.Debug("write error -> stopping read")
 					if conn != nil {
-						conn.Close()  // this also makes read to exit
+						conn.Close() // this also makes read to exit
 						conn = nil
 					}
-					sts_ch <- Status{DISCONNECTED, err}
+					statusChannel <- Status{Disconnected, err}
 				} else {
 					// both read and write goroutines have exited
 					Log.Debug("write error -> starting connect()")
-					go connect()
+					go m.connect()
 				}
-			case cmd, ok := <-cmd_ch:
+			case cmd, ok := <-commandChannel:
 				if ok {
 					Log.Debug("received command", "cmd", cmd)
 				}
 				switch {
-				case !ok || cmd == QUIT:
-					if reading || writing || conn != nil {sts_ch <- Status{DISCONNECTED, nil}}
-					break main_loop  // defer should clean everything up
-				case cmd == PING:
-					if conn != nil && writing {w_control_ch <- cmd}
-				case cmd == USE_TEXT:
-					msg_type = websocket.TextMessage
-					if writing {w_control_ch <- cmd}
-				case cmd == USE_BINARY:
-					msg_type = websocket.BinaryMessage
-					if writing {w_control_ch <- cmd}
+				case !ok || cmd == Quit:
+					if reading || writing || conn != nil {
+						statusChannel <- Status{Disconnected, nil}
+					}
+					break mainLoop // defer should clean everything up
+				case cmd == Ping:
+					if conn != nil && writing {
+						writeControlChannel <- cmd
+					}
+				case cmd == UseText:
+					messageType = websocket.TextMessage
+					if writing {
+						writeControlChannel <- cmd
+					}
+				case cmd == UseBinary:
+					messageType = websocket.BinaryMessage
+					if writing {
+						writeControlChannel <- cmd
+					}
 				default:
 					panic(fmt.Sprintf("unsupported command: %v", cmd))
 				}
 			}
 		}
 	}()
+}
 
-	return & Machine{url, headers, inp_ch, out_ch, sts_ch, cmd_ch}
+func read(conn *websocket.Conn) {
+	wg.Add(1)
+	defer wg.Done()
+
+	Log.Debug("read has started")
+
+	for {
+		if _, msg, err := conn.ReadMessage(); err == nil {
+			Log.Debug("received message", "msg", string(msg))
+			ioEventChannel <- true
+			inputChannel <- msg
+		} else {
+			Log.Debug("read error", "err", err)
+			readErrorChannel <- err
+			break
+		}
+	}
+}
+
+func write(conn *websocket.Conn, messageType int) {
+	wg.Add(1)
+	defer wg.Done()
+
+	Log.Debug("write has started")
+
+loop:
+	for {
+		select {
+		case msg, ok := <-outputChannel:
+			if ok {
+				ioEventChannel <- true
+				if err := conn.SetWriteDeadline(time.Now().Add(3 * time.Second)); err != nil {
+					writeErrorChannel <- err
+					break loop
+				}
+				if err := conn.WriteMessage(messageType, msg); err != nil {
+					writeErrorChannel <- err
+					break loop
+				}
+				conn.SetWriteDeadline(time.Time{}) // reset write deadline
+			} else {
+				Log.Debug("write error", "err", "outputChannel closed")
+				writeErrorChannel <- errors.New("outputChannel closed")
+				break loop
+			}
+		case cmd, ok := <-writeControlChannel:
+			if !ok {
+				writeErrorChannel <- errors.New("writeControlChannel closed")
+				break loop
+			} else {
+				switch cmd {
+				case Quit:
+					Log.Debug("write received Quit command")
+					writeErrorChannel <- errors.New("cancelled")
+					break loop
+				case Ping:
+					if err := conn.WriteControl(websocket.PingMessage, []byte{}, time.Now().Add(3*time.Second)); err != nil {
+						Log.Debug("ping error", "err", err)
+						writeErrorChannel <- errors.New("cancelled")
+						break loop
+					}
+				case UseText:
+					messageType = websocket.TextMessage
+				case UseBinary:
+					messageType = websocket.BinaryMessage
+				}
+			}
+		}
+	}
+}
+
+func (m *Machine) keepAlive() {
+	wg.Add(1)
+	defer wg.Done()
+
+	Log.Debug("keepAlive has started")
+
+	dur, err := time.ParseDuration(m.KeepAliveInterval)
+	if err != nil {
+		fmt.Println("cannot parse duration")
+		os.Exit(0)
+	}
+	timer := time.NewTimer(dur)
+	timer.Stop()
+
+loop:
+	for {
+		select {
+		case _, ok := <-ioEventChannel:
+			if ok {
+				timer.Reset(dur)
+			} else {
+				timer.Stop()
+				break loop
+			}
+		case <-timer.C:
+			timer.Reset(dur)
+			// non-blocking Ping request
+			select {
+			case writeControlChannel <- Ping:
+			default:
+			}
+		}
+	}
+}
+
+func (m *Machine) connect() {
+	wg.Add(1)
+	defer wg.Done()
+
+	Log.Debug("connect has started")
+
+	reconnectInterval, err := time.ParseDuration(m.ReconnectInterval)
+	if err != nil {
+		fmt.Println("cannot parse duration")
+		os.Exit(0)
+	}
+
+	for {
+		statusChannel <- Status{State: Connecting}
+		dialer := websocket.Dialer{HandshakeTimeout: 5 * time.Second}
+		conn, _, err := dialer.Dial(m.URL, m.Headers)
+		if err == nil {
+			conn.SetPongHandler(func(string) error { ioEventChannel <- true; return nil })
+			connReturnChannel <- conn
+			statusChannel <- Status{State: Connected}
+			return
+		} else {
+			Log.Debug("connect error", "err", err)
+			statusChannel <- Status{Disconnected, err}
+		}
+
+		statusChannel <- Status{State: Waiting}
+		select {
+		case <-time.After(reconnectInterval):
+		case <-connCancelChannel:
+			statusChannel <- Status{Disconnected, errors.New("cancelled")}
+			return
+		}
+	}
 }
