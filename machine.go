@@ -70,7 +70,7 @@ var ioEventChannel chan bool
 
 func init() {
 	// disable the logger by default
-	//Log.SetHandler(log15.DiscardHandler())
+	Log.SetHandler(log15.DiscardHandler())
 }
 
 func (s State) String() string {
@@ -84,7 +84,7 @@ func (s State) String() string {
 	case Waiting:
 		return "Waiting"
 	}
-	return fmt.Sprintf("Unknown status %v", s)
+	return "Unknown status"
 }
 
 func (c Command) String() string {
@@ -98,7 +98,7 @@ func (c Command) String() string {
 	case UseBinary:
 		return "UseBinary"
 	}
-	return fmt.Sprintf("Unknown command %v", c)
+	return "Unknown command"
 }
 
 func New(url string, headers http.Header) *Machine {
@@ -117,6 +117,10 @@ func New(url string, headers http.Header) *Machine {
 	ioEventChannel = make(chan bool, 2)
 
 	return &Machine{url, headers, inputChannel, outputChannel, statusChannel, commandChannel, reconnectInterval, keepaliveInterval}
+}
+
+func (m *Machine) SetLogHandler(handler log15.Handler) {
+	Log.SetHandler(handler)
 }
 
 func (m *Machine) Start() {
